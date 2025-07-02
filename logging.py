@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from discord import app_commands, Interaction, Member, Guild, Webhook, TextChannel, CategoryChannel, AuditLogAction, VoiceChannel, StageChannel
+from discord import app_commands, Interaction, Member, Guild, Webhook, TextChannel, AuditLogAction, VoiceChannel, StageChannel ,Role
 import aiohttp
 from zoneinfo import ZoneInfo
 import datetime
@@ -19,20 +19,21 @@ class LoggingCog(commands.Cog):
         self.session = None
         self.logging_color = 0xFF5858
         self.log_channel_details = {
-            "system": {"name": "》》system_logs『💻』", "emoji": "💻"},
-            "member": {"name": "》》member_logs『👤』", "emoji": "👤"},
-            "message": {"name": "》》message_logs『💬』", "emoji": "💬"},
-            "voice": {"name": "》》voice_logs『🔊』", "emoji": "🔊"},
-            "moderation": {"name": "》》moderation_logs『🔨』", "emoji": "🔨"},
-            "channel": {"name": "》》channel_logs『📩』", "emoji": "📩"},
-            "server": {"name": "》》server_logs『🌐』", "emoji": "🌐"},
-            "webhook": {"name": "》》webhook_logs『🔗』","emoji": "🔗"},
-            "role": {"name": "》》role_logs『⚙️』","emoji": "⚙️"},
-            "application": {"name": "》》application_logs『🤖』","emoji": "🤖"}
+            "system": {"name": "system logs", "emoji": "💻"},
+            "member": {"name": "member logs", "emoji": "👤"},
+            "message": {"name": "message logs", "emoji": "💬"},
+            "voice": {"name": "voice logs", "emoji": "🔊"},
+            "moderation": {"name": "moderation logs", "emoji": "🔨"},
+            "channel": {"name": "channel logs", "emoji": "📩"},
+            "server": {"name": "server logs", "emoji": "🌐"},
+            "webhook": {"name": "webhook logs","emoji": "🔗"},
+            "role": {"name": "role logs","emoji": "⚙️"},
+            "application": {"name": "application logs","emoji": "🤖"},
+            "alert": {"name": "alert logs", "emoji": "⚠️"}
         }
         self.log_types = list(self.log_channel_details.keys())
-        self.category_name = "✦────── 💬│Server_Logs ─────────✦"
-        self.log_view_role_name = "log_view"
+        self.category_name = "💬│Server Logs"
+        self.log_view_role_name = "log view"
     async def cog_load(self):
         print("Logging Cog loaded.")
         self.session = aiohttp.ClientSession()
@@ -67,7 +68,12 @@ class LoggingCog(commands.Cog):
                     "log_category_id": None,
                     "log_channel_ids": {},
                     "webhooks": {},
-                    "logging_enabled": True
+                    "logging_enabled": False,
+                    "ignore_embeds": False,
+                    "ignored_channels": [],
+                    "ignored_users": [],
+                    "ignored_roles": [],
+                    "voice_log_ignore": False
                 }
                 await db.execute('INSERT INTO logging_guild_configs (guild_id, config) VALUES (?, ?)',
                                  (guild_id, json.dumps(default_config)))
@@ -201,8 +207,14 @@ class LoggingCog(commands.Cog):
         if not config:
             return None
         try:
+            existing_webhooks = await channel.webhooks()
+            for webhook in existing_webhooks:
+                if webhook.user and webhook.user.id == self.bot.user.id:
+                    config["webhooks"][log_type] = webhook.url
+                    await self.update_guild_config_async(guild.id, config)
+                    return webhook
             bot_avatar_url = self.bot.user.avatar.url if self.bot.user.avatar else None
-            webhook_name = f"{self.bot.user.name} {log_type.replace('_', ' ').title()} Logs"
+            webhook_name = f"{self.bot.user.name} Logging"
             webhook = await channel.create_webhook(
                 name=webhook_name,
                 avatar=await self.bot.user.avatar.read() if bot_avatar_url else None,
@@ -218,8 +230,10 @@ class LoggingCog(commands.Cog):
             print(f"Error creating webhook for {log_type} in guild {guild.id}: {e}")
             return None
 
-    logging_group = app_commands.Group(name="logging", description="Manage logging in the server.", default_permissions=discord.Permissions(administrator=True))
-    @logging_group.command(name="setup_auto", description="Automatically sets up logging channels in a dedicated category.")
+    logging_group = app_commands.Group(name="logging", description="Manage logging in the server.", default_permissions=discord.Permissions(administrator=True) , guild_only=True)
+    setup_group = app_commands.Group(name="setup", parent=logging_group, description="Commands to set up logging.")
+    ignore_group = app_commands.Group(name="ignore", parent=logging_group, description="Commands to ignore certain logging events.")
+    @setup_group.command(name="auto", description="Automatically sets up logging channels in a dedicated category.")
     async def logging_setup_auto(self, interaction: Interaction):
         guild = interaction.guild
         if not guild:
@@ -262,17 +276,27 @@ class LoggingCog(commands.Cog):
                 await interaction.followup.send(f"Error updating logging category permissions: {e}", ephemeral=True)
                 return
         config = await self.get_guild_config_async(guild.id)
+        config["logging_enabled"] = True
         config["log_category_id"] = category.id
-        config["log_channel_ids"] = {}
-        config["webhooks"] = {}
-        created_channels_mentions = []
+        if "log_channel_ids" not in config:
+            config["log_channel_ids"] = {}
+        if "webhooks" not in config:
+            config["webhooks"] = {}
+        created_or_updated_channels_mentions = []
         for log_type, details in self.log_channel_details.items():
             channel_name = details["name"]
-            existing_channel = discord.utils.get(category.text_channels, name=channel_name)
             channel_to_use = None
-            if existing_channel:
-                channel_to_use = existing_channel
-            else:
+            existing_channel_id = config.get("log_channel_ids", {}).get(log_type)
+            if existing_channel_id:
+                channel = guild.get_channel(existing_channel_id)
+                if channel and isinstance(channel, discord.TextChannel):
+                    channel_to_use = channel
+                else:
+                    if log_type in config.get("log_channel_ids", {}):
+                        del config["log_channel_ids"][log_type]
+                    if log_type in config.get("webhooks", {}):
+                        del config["webhooks"][log_type]
+            if not channel_to_use:
                 try:
                     channel_to_use = await guild.create_text_channel(
                         name=channel_name,
@@ -280,28 +304,31 @@ class LoggingCog(commands.Cog):
                         topic=f"Logs for {channel_name.replace('》》','').replace('『','').replace('』','')[:-1].replace('_',' ').title()} events.",
                         reason=f"Automatic logging setup for {log_type}"
                     )
+                    created_or_updated_channels_mentions.append(channel_to_use.mention)
                 except discord.Forbidden:
                     await interaction.followup.send(f"I don't have permissions to create channels in {category.mention}. Please grant 'Manage Channels'.", ephemeral=True)
-                    return
+                    continue
                 except Exception as e:
                     await interaction.followup.send(f"Error creating channel for {log_type}: {e}", ephemeral=True)
+                    continue 
             if channel_to_use:
-                config["log_channel_ids"][log_type] = channel_to_use.id
-                created_channels_mentions.append(channel_to_use.mention)
+                if config.get("log_channel_ids", {}).get(log_type) != channel_to_use.id:
+                    config["log_channel_ids"][log_type] = channel_to_use.id
+                    if channel_to_use.mention not in created_or_updated_channels_mentions:
+                        created_or_updated_channels_mentions.append(channel_to_use.mention)
                 try:
                     webhook = await self.create_and_save_webhook_for_channel(guild, log_type, channel_to_use)
-                    if not webhook:
-                        await interaction.followup.send(f"Failed to create webhook for {log_type} in {channel_to_use.mention}. Check bot's 'Manage Webhooks' permission.", ephemeral=True)
+                    if not webhook: 
+                        print(f"Failed to create webhook for {log_type} in {channel_to_use.mention} for guild {guild.id}.")
                 except Exception as e:
                     print(f"Failed to set up webhook for {log_type} in {channel_to_use.mention}: {e}")
-                    await interaction.followup.send(f"Error creating webhook for {log_type} in {channel_to_use.mention}: {e}", ephemeral=True)
         await self.update_guild_config_async(guild.id, config)
-        if created_channels_mentions:
-            await interaction.followup.send(f"Automatic logging setup complete! Created/updated category {category.mention} with channels: {', '.join(created_channels_mentions)}.", ephemeral=True)
+        if created_or_updated_channels_mentions:
+            await interaction.followup.send(f"Automatic logging setup complete! Created/updated category {category.mention} and configured channels: {', '.join(created_or_updated_channels_mentions)}.", ephemeral=True)
         else:
-            await interaction.followup.send(f"Automatic logging setup complete! Category {category.mention} already exists and channels are configured. Role `{self.log_view_role_name}` has been created/updated with view permissions.", ephemeral=True)
+            await interaction.followup.send(f"Automatic logging setup complete! All logging channels were already configured in {category.mention}. Role `{self.log_view_role_name}` has been created/updated with view permissions.", ephemeral=True)
 
-    @logging_group.command(name="setup_channel", description="Sets up a specific log channel for a chosen log type.")
+    @setup_group.command(name="channel", description="Sets up a specific log channel for a chosen log type.")
     @app_commands.choices(log_type=[
         app_commands.Choice(name="System Logs", value="system"),
         app_commands.Choice(name="Member Logs", value="member"),
@@ -321,6 +348,7 @@ class LoggingCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         config = await self.get_guild_config_async(guild.id)
+        config["logging_enabled"] = True
         current_log_type = log_type.value
         channel_to_use = channel
         config["log_channel_ids"][current_log_type] = channel_to_use.id
@@ -336,43 +364,101 @@ class LoggingCog(commands.Cog):
         await self.update_guild_config_async(guild.id, config)
         await interaction.followup.send(f"Successfully set up {log_type.name} in {channel_to_use.mention}. The bot will now use this channel for {log_type.name}.", ephemeral=True)
 
-    @logging_group.command(name="recreate_webhooks", description="Re-creates all logging webhooks for configured channels.")
-    async def logging_recreate_webhooks(self, interaction: Interaction):
-        guild_id = interaction.guild.id
-        config = await self.get_guild_config_async(guild_id)
-        log_channel_ids = config.get("log_channel_ids", {})
-        if not log_channel_ids:
-            await interaction.response.send_message("No logging channels are configured. Please run `/logging_setup_auto` first.", ephemeral=True)
+    async def _setup_log_channel(self, interaction: Interaction, log_type: str, channel: TextChannel):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        config["webhooks"] = {}
-        recreated_count = 0
-        for log_type, channel_id in log_channel_ids.items():
-            channel = interaction.guild.get_channel(channel_id)
-            if not channel or not isinstance(channel, TextChannel):
-                print(f"Configured channel ID {channel_id} for {log_type} is not a valid text channel or does not exist.")
-                continue
-            existing_webhooks = await channel.webhooks()
-            for webhook in existing_webhooks:
-                if webhook.user == self.bot.user:
-                    try:
-                        await webhook.delete(reason="Recreating logging webhooks")
-                    except discord.Forbidden:
-                        await interaction.followup.send(f"Missing permissions to delete existing webhooks in {channel.mention}. Please grant 'Manage Webhooks'.", ephemeral=True)
-                        return
-                    except Exception as e:
-                        print(f"Error deleting webhook {webhook.name}: {e}")
-            try:
-                webhook = await self.create_and_save_webhook_for_channel(interaction.guild, log_type, channel)
-                if webhook:
-                    recreated_count += 1
-                else:
-                    await interaction.followup.send(f"Failed to re-create webhook for {log_type} in {channel.mention}. Check bot's 'Manage Webhooks' permission.", ephemeral=True)
-            except Exception as e:
-                print(f"Error re-creating webhook for {log_type} in {channel.mention}: {e}")
-                await interaction.followup.send(f"Error re-creating webhook for {log_type} in {channel.mention}: {e}", ephemeral=True)
-        await self.update_guild_config_async(guild_id, config)
-        await interaction.followup.send(f"Re-created {recreated_count} logging webhooks. Check specific channels for any permission issues.", ephemeral=True)
+        config = await self.get_guild_config_async(guild.id)
+        config["logging_enabled"] = True
+        config["log_channel_ids"][log_type] = channel.id
+        try:
+            webhook = await self.create_and_save_webhook_for_channel(guild, log_type, channel)
+            if not webhook:
+                await interaction.followup.send(f"Failed to create webhook for {log_type} logs in {channel.mention}. Please check the bot's 'Manage Webhooks' permission.", ephemeral=True)
+                return
+        except Exception as e:
+            await interaction.followup.send(f"An error occurred while creating the webhook for {log_type} logs: {e}", ephemeral=True)
+            return
+        await self.update_guild_config_async(guild.id, config)
+        await interaction.followup.send(f"Successfully set up `{log_type} logs` in {channel.mention}.", ephemeral=True)
+
+    @logging_group.command(name="system_logs", description="Sets the channel for system logs.")
+    async def system_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "system", channel)
+
+    @logging_group.command(name="member_logs", description="Sets the channel for member logs.")
+    async def member_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "member", channel)
+
+    @logging_group.command(name="message_logs", description="Sets the channel for message logs.")
+    async def message_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "message", channel)
+
+    @logging_group.command(name="voice_logs", description="Sets the channel for voice logs.")
+    async def voice_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "voice", channel)
+
+    @logging_group.command(name="moderation_logs", description="Sets the channel for moderation logs.")
+    async def moderation_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "moderation", channel)
+
+    @logging_group.command(name="channel_logs", description="Sets the channel for channel logs.")
+    async def channel_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "channel", channel)
+
+    @logging_group.command(name="server_logs", description="Sets the channel for server logs.")
+    async def server_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "server", channel)
+
+    @logging_group.command(name="webhook_logs", description="Sets the channel for webhook logs.")
+    async def webhook_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "webhook", channel)
+
+    @logging_group.command(name="role_logs", description="Sets the channel for role logs.")
+    async def role_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "role", channel)
+
+    @logging_group.command(name="application_logs", description="Sets the channel for application logs.")
+    async def application_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "application", channel) 
+
+    @logging_group.command(name="alert_logs", description="Sets the channel for critical security alerts.")
+    async def alert_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "alert", channel)
+
+    @logging_group.command(name="disable", description="Disables logging for a specific log type.")
+    @app_commands.choices(log_type=[
+        app_commands.Choice(name="System Logs", value="system"),
+        app_commands.Choice(name="Member Logs", value="member"),
+        app_commands.Choice(name="Message Logs", value="message"),
+        app_commands.Choice(name="Voice Logs", value="voice"),
+        app_commands.Choice(name="Moderation Logs", value="moderation"),
+        app_commands.Choice(name="Channel Logs", value="channel"),
+        app_commands.Choice(name="Server Logs", value="server"),
+        app_commands.Choice(name="Webhook Logs", value="webhook"),
+        app_commands.Choice(name="Role Logs", value="role"),
+        app_commands.Choice(name="Application Logs", value="application")
+    ])
+    async def logging_disable(self, interaction: Interaction, log_type: app_commands.Choice[str]):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return 
+        await interaction.response.defer(ephemeral=True)
+        config = await self.get_guild_config_async(guild.id)
+        log_type_value = log_type.value
+        current_channel_id = config.get("log_channel_ids", {}).get(log_type_value)
+        if not current_channel_id:
+            await interaction.followup.send(f"Logging for `{log_type.name}` is not currently configured.", ephemeral=True)
+            return
+        if log_type_value in config.get("log_channel_ids", {}):
+            del config["log_channel_ids"][log_type_value]
+        if log_type_value in config.get("webhooks", {}):
+            del config["webhooks"][log_type_value]
+        await self.update_guild_config_async(guild.id, config)
+        await interaction.followup.send(f"Logging for `{log_type.name}` has been disabled.", ephemeral=True)
 
     @logging_group.command(name="toggle", description="Enable or disable logging for this server.")
     @app_commands.choices(state=[
@@ -390,7 +476,6 @@ class LoggingCog(commands.Cog):
             description=f"> **Status :** {state.value.lower().capitalize()}\n> **Action By :** {interaction.user.mention}",
             color=self.logging_color
         )
-        embed.set_author(name=f"{self.bot.user.name} System Logs", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
         embed.set_thumbnail(url=self.bot.user.avatar.url if self.bot.user.avatar else None)
         await self.send_embed(interaction.guild, "system", embed)
 
@@ -398,69 +483,35 @@ class LoggingCog(commands.Cog):
     async def logging_status(self, interaction: Interaction):
         guild_id = interaction.guild.id
         config = await self.get_guild_config_async(guild_id)
-        logging_enabled_status = "Enabled" if config.get("logging_enabled") else "Disabled"
         category_id = config.get("log_category_id")
         category = interaction.guild.get_channel(category_id) if category_id else None
-        category_mention = category.mention if category else "Not Set"
+        category_mention = category.mention if category else "`Not Set`"
         channel_status_lines = []
         log_channel_ids = config.get("log_channel_ids", {})
-        for log_type in self.log_types:
+        guide_arrow_emoji = "<:guidearrow:1378319093530366103>"
+        for log_type, details in self.log_channel_details.items():
             channel_id = log_channel_ids.get(log_type)
             channel_obj = interaction.guild.get_channel(channel_id) if channel_id else None
-            channel_mention = channel_obj.mention if channel_obj else "Not Set"
-            channel_status_lines.append(f"- **{log_type.title()} Logs:** {channel_mention}")
-        webhook_status_lines = []
-        webhooks_config = config.get("webhooks", {})
-        for log_type in self.log_types:
-            webhook_url = webhooks_config.get(log_type)
-            if webhook_url:
-                webhook_status_lines.append(f"- **{log_type.title()}:** Configured")
-            else:
-                webhook_status_lines.append(f"- **{log_type.title()}:** Not Configured")
+            channel_mention = channel_obj.mention if channel_obj else "`Not configured`"
+            log_name = details["name"].title()
+            channel_status_lines.append(f"{guide_arrow_emoji} | **{log_name}** : {channel_mention}")
         description = (
-            f"> **Status :** {logging_enabled_status}\n"
             f"> **Category :** {category_mention}\n\n"
-            f"**__Logging Channels__**\n"
-            f"{'```\n' + 'Not configured yet.\n```' if not channel_status_lines else '\n'.join(channel_status_lines)}\n\n"
-            f"**__Webhook Status__**\n"
-            f"{'```\n' + 'No webhooks configured yet.\n```' if not webhook_status_lines else '\n'.join(webhook_status_lines)}\n\n"
-            f"- **Checked By :** {interaction.user.mention}\n"
-            f"- **Time :** {get_indian_time().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"**__Logging Channels__**\n\n"
+            f"{'\n'.join(channel_status_lines)}"
         )
         status_embed = discord.Embed(
-            title="Server Logging Configuration",
+            title="Logging status",
             description=description,
-            color=self.logging_color
+            color=11579568,
+            timestamp=get_indian_time()
         )
-        status_embed.set_author(name=f"{self.bot.user.name} Logging system", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-        status_embed.set_thumbnail(url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-        status_embed.set_footer(text=f"{self.bot.user.name} • Logging Status", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
+        if self.bot.user.avatar:
+            status_embed.set_thumbnail(url=self.bot.user.avatar.url)
+            status_embed.set_footer(text=self.bot.user.name, icon_url=self.bot.user.avatar.url)
+        else:
+            status_embed.set_footer(text=self.bot.user.name)
         await interaction.response.send_message(embed=status_embed, ephemeral=True)
-
-    @logging_group.command(name="features", description="Shows all available logging features.")
-    async def logging_features(self, interaction: Interaction):
-        features_list = []
-        for log_type, details in self.log_channel_details.items():
-            features_list.append(f"- `{details['emoji']} {log_type.replace('_', ' ').title()} Logs:` ```Tracks {log_type.replace('_', ' ').lower()} related events.```")
-        
-        description = (
-            f"> **__Available Logging Features__**\n"
-            f"> This lists all the types of events this logging system can track.\n\n"
-            f"{'\n'.join(features_list)}\n\n"
-            f"- **Checked By :** {interaction.user.mention}\n"
-            f"- **Time :** {get_indian_time().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-
-        features_embed = discord.Embed(
-            title="Logging Features Overview",
-            description=description,
-            color=self.logging_color
-        )
-        features_embed.set_author(name=f"{self.bot.user.name} Logging system", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-        features_embed.set_thumbnail(url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-        features_embed.set_footer(text=f"{self.bot.user.name} • Logging Features", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-
-        await interaction.response.send_message(embed=features_embed, ephemeral=True)
 
     @logging_group.command(name="help", description="Shows how to fully set up the logging system.")
     async def logging_help(self, interaction: Interaction):
@@ -504,7 +555,7 @@ class LoggingCog(commands.Cog):
         help_embed.set_footer(text=f"{self.bot.user.name} • Logging Help", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
         await interaction.response.send_message(embed=help_embed, ephemeral=True)
 
-    @logging_group.command(name="clear_setup", description="Clears the entire logging setup for this server.") 
+    @setup_group.command(name="clear", description="Clears the entire logging setup for this server.") 
     async def logging_clear_setup(self, interaction: Interaction):
         guild = interaction.guild
         if not guild:
@@ -512,83 +563,176 @@ class LoggingCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         config = await self.get_guild_config_async(guild.id)
-        feedback_messages = []
         config["logging_enabled"] = False
-
-        category_id = config.get("log_category_id")
-        if category_id:
-            category = guild.get_channel(category_id)
-            if category and isinstance(category, CategoryChannel):
-                try:
-                    for channel in category.channels:
-                        await channel.delete(reason="Logging setup cleared by command.")
-                        feedback_messages.append(f"Deleted channel: `{channel.name}`")
-                    await category.delete(reason="Logging setup cleared by command.")
-                    feedback_messages.append(f"Deleted logging category: `{category.name}`")
-                except discord.Forbidden:
-                    feedback_messages.append("I lack permissions to delete the logging category or its channels. Please grant 'Manage Channels'.")
-                except Exception as e:
-                    feedback_messages.append(f"Error deleting logging category: {e}")
-            else:
-                feedback_messages.append("Logging category not found or already deleted.")
-            
-            log_view_role = discord.utils.get(guild.roles, name=self.log_view_role_name)
-            if log_view_role:
-                try:
-                    await log_view_role.delete(reason="Logging setup cleared by command.")
-                    feedback_messages.append(f"Deleted role: `{self.log_view_role_name}`")
-                except discord.Forbidden:
-                    feedback_messages.append("I lack permissions to delete the `log_view` role. Please grant 'Manage Roles'.")
-                except Exception as e:
-                    feedback_messages.append(f"Error deleting `log_view` role: {e}")
-            else:
-                feedback_messages.append("`log_view` role not found or already deleted.")
-        else:
-            feedback_messages.append("No logging category was automatically set up. Clearing webhooks and database entries only.")
-            for log_type, channel_id in config.get("log_channel_ids", {}).items():
-                channel = guild.get_channel(channel_id)
-                if channel and isinstance(channel, TextChannel):
-                    try:
-                        existing_webhooks = await channel.webhooks()
-                        for webhook in existing_webhooks:
-                            if webhook.user == self.bot.user:
-                                await webhook.delete(reason=f"Clearing manual logging setup for {log_type}")
-                                feedback_messages.append(f"Deleted webhook for `{log_type}` in {channel.mention}.")
-                    except discord.Forbidden:
-                        feedback_messages.append(f"I lack permissions to delete webhooks in {channel.mention} for {log_type}.")
-                    except Exception as e:
-                        feedback_messages.append(f"Error deleting webhook for {log_type} in {channel.mention}: {e}")
-                else:
-                    feedback_messages.append(f"Configured channel for `{log_type}` (ID: {channel_id}) not found or not a text channel. Skipping webhook deletion.")
-
         config["log_category_id"] = None
         config["log_channel_ids"] = {}
         config["webhooks"] = {}
         await self.update_guild_config_async(guild.id, config)
-        feedback_messages.append("Logging configuration cleared from the database.")
-
         description_content = []
         description_content.append(f"> **__Logging Setup Clear Report__**\n")
-        description_content.append(f"> This report summarizes the actions taken to clear the logging setup.\n\n")
-        description_content.append(f"**__Details__**\n")
-        if feedback_messages:
-            for msg in feedback_messages:
-                description_content.append(f"- {msg}")
-        else:
-            description_content.append("- No specific actions were taken or reported.")
-        description_content.append(f"\n- **Cleared By :** {interaction.user.mention}")
+        description_content.append(f"> Logging has been stopped and its configuration cleared from the database.\n")
+        description_content.append(f"> **No channels, categories, or roles were deleted.**\n\n")
+        description_content.append(f"- **Cleared By :** {interaction.user.mention}")
         description_content.append(f"- **Time :** {get_indian_time().strftime('%Y-%m-%d %H:%M:%S')}")
         description = "\n".join(description_content)
-
         clear_embed = discord.Embed(
             title="Logging Setup Clear Report",
             description=description,
-            color=self.logging_color
+            color=self.logging_color,
+            timestamp=get_indian_time()
         )
         clear_embed.set_author(name=f"{self.bot.user.name} Logging system", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
         clear_embed.set_thumbnail(url=self.bot.user.avatar.url if self.bot.user.avatar else None)
         clear_embed.set_footer(text=f"{self.bot.user.name} • Logging Clear", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
         await interaction.followup.send(embed=clear_embed, ephemeral=True)
+
+    @ignore_group.command(name="embed", description="Toggle ignoring embeds in message logs.")
+    @app_commands.choices(state=[
+        app_commands.Choice(name="enabled", value="enabled"),
+        app_commands.Choice(name="disabled", value="disabled")
+    ])
+    async def logging_ignore_embed(self, interaction: Interaction, state: app_commands.Choice[str]):
+        guild_id = interaction.guild.id
+        config = await self.get_guild_config_async(guild_id)
+        is_enabled = state.value.lower() == "enabled"
+        config["ignore_embeds"] = is_enabled
+        await self.update_guild_config_async(guild_id, config)
+        status = "enabled" if is_enabled else "disabled"
+        await interaction.response.send_message(f"Ignoring embeds in message logs has been {status}.", ephemeral=True)
+        embed = discord.Embed(
+            title="Logging Status",
+            description=f"> ** Ignore Embeds :** {status.capitalize()}\n> **Action By :** {interaction.user.mention}",
+            color=self.logging_color
+        )
+        embed.set_thumbnail(url=self.bot.user.avatar.url if self.bot.user.avatar else None)
+        await self.send_embed(interaction.guild, "system", embed)
+    
+    @ignore_group.command(name="channel", description="Ignore a channel from being logged.")
+    async def ignore_channel(self, interaction: Interaction, channel: Union[TextChannel, VoiceChannel, StageChannel]):
+        guild_id = interaction.guild.id
+        config = await self.get_guild_config_async(guild_id)
+        if channel.id not in config["ignored_channels"]:
+            config["ignored_channels"].append(channel.id)
+            await self.update_guild_config_async(guild_id, config)
+            await interaction.response.send_message(f"Logs from {channel.mention} will now be ignored.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"{channel.mention} is already in the ignored list.", ephemeral=True)
+
+    @ignore_group.command(name="user", description="Ignore a user from being logged.")
+    async def ignore_user(self, interaction: Interaction, user: Member):
+        guild_id = interaction.guild.id
+        config = await self.get_guild_config_async(guild_id)
+        if user.id not in config["ignored_users"]:
+            config["ignored_users"].append(user.id)
+            await self.update_guild_config_async(guild_id, config)
+            await interaction.response.send_message(f"Logs from {user.mention} will now be ignored.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"{user.mention} is already in the ignored list.", ephemeral=True)
+
+    @ignore_group.command(name="role", description="Ignore a role from being logged.")
+    async def ignore_role(self, interaction: Interaction, role: Role):
+        guild_id = interaction.guild.id
+        config = await self.get_guild_config_async(guild_id)
+        if role.id not in config["ignored_roles"]:
+            config["ignored_roles"].append(role.id)
+            await self.update_guild_config_async(guild_id, config)
+            await interaction.response.send_message(f"Logs from users with the {role.mention} role will now be ignored.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"The {role.mention} role is already in the ignored list.", ephemeral=True)
+
+    @ignore_group.command(name="voice", description="Enable or disable voice logging for ignored users.")
+    @app_commands.choices(state=[
+        app_commands.Choice(name="enable", value="enable"),
+        app_commands.Choice(name="disable", value="disable")
+    ])
+    async def ignore_voice(self, interaction: Interaction, state: app_commands.Choice[str]):
+        guild_id = interaction.guild.id
+        config = await self.get_guild_config_async(guild_id)
+        is_enabled = state.value.lower() == "enable"
+        config["voice_log_ignore"] = is_enabled
+        await self.update_guild_config_async(guild_id, config)
+        status = "enabled" if is_enabled else "disabled"
+        await interaction.response.send_message(f"Voice logging for ignored users has been {status}.", ephemeral=True)
+        embed = discord.Embed(
+            title="Logging Status",
+            description=f"> **Ignore Voice :** {status.capitalize()}\n> **Action By :** {interaction.user.mention}",
+            color=self.logging_color
+        )
+        embed.set_thumbnail(url=self.bot.user.avatar.url if self.bot.user.avatar else None)
+        await self.send_embed(interaction.guild, "system", embed)
+        
+    async def ignore_remove_autocomplete(self, interaction: Interaction, current: str) -> list[app_commands.Choice[str]]:
+        guild = interaction.guild
+        config = await self.get_guild_config_async(guild.id)
+        choices = []
+        ignored_channels = config.get("ignored_channels", [])
+        for channel_id in ignored_channels:
+            channel = guild.get_channel(channel_id)
+            if channel and (not current or current.lower() in channel.name.lower()):
+                choices.append(app_commands.Choice(name=f"#{channel.name}", value=f"channel_{channel_id}"))
+        ignored_users = config.get("ignored_users", [])
+        for user_id in ignored_users:
+            user = guild.get_member(user_id)
+            if user and (not current or current.lower() in user.display_name.lower() or current.lower() in user.name.lower()):
+                choices.append(app_commands.Choice(name=f"@{user.name} ({user.display_name})", value=f"user_{user_id}"))
+        ignored_roles = config.get("ignored_roles", [])
+        for role_id in ignored_roles:
+            role = guild.get_role(role_id)
+            if role and (not current or current.lower() in role.name.lower()):
+                choices.append(app_commands.Choice(name=f"@{role.name} [Role]", value=f"role_{role_id}"))
+        return choices[:25]
+    
+    @ignore_group.command(name="remove", description="Remove a channel, user, or role from the ignored list.")
+    @app_commands.autocomplete(entity=ignore_remove_autocomplete)
+    async def ignore_remove(self, interaction: Interaction, entity: str):
+        guild = interaction.guild
+        guild_id = guild.id
+        config = await self.get_guild_config_async(guild_id)
+        try:
+            entity_type, entity_id_str = entity.split("_")
+            entity_id = int(entity_id_str)
+        except ValueError:
+            await interaction.response.send_message("Invalid selection. Please choose an item from the list.", ephemeral=True)
+            return
+        removed = False
+        entity_mention = ""
+        if entity_type == "channel":
+            if entity_id in config["ignored_channels"]:
+                config["ignored_channels"].remove(entity_id)
+                removed = True
+                channel = guild.get_channel(entity_id)
+                entity_mention = channel.mention if channel else f"`{entity_id}`"
+        elif entity_type == "user":
+            if entity_id in config["ignored_users"]:
+                config["ignored_users"].remove(entity_id)
+                removed = True
+                user = guild.get_member(entity_id)
+                entity_mention = user.mention if user else f"`{entity_id}`"
+        elif entity_type == "role":
+            if entity_id in config["ignored_roles"]:
+                config["ignored_roles"].remove(entity_id)
+                removed = True
+                role = guild.get_role(entity_id)
+                entity_mention = role.mention if role else f"`{entity_id}`"
+        if removed:
+            await self.update_guild_config_async(guild_id, config)
+            await interaction.response.send_message(f"Removed {entity_mention} from the ignored list.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Could not find the specified entity in the ignored list.", ephemeral=True)
+
+    async def _is_ignored(self, guild_id: int, user: Member = None, channel: Union[TextChannel, VoiceChannel, StageChannel] = None) -> bool:
+        config = await self.get_guild_config_async(guild_id)
+        if not config.get("logging_enabled", False):
+            return True
+        if channel and channel.id in config.get("ignored_channels", []):
+            return True
+        if user:
+            if user.id in config.get("ignored_users", []):
+                return True
+            user_roles = getattr(user, 'roles', [])
+            if any(role.id in config.get("ignored_roles", []) for role in user_roles):
+                return True
+        return False
 
     @commands.Cog.listener()
     async def on_member_join(self, member: Member):
@@ -647,7 +791,25 @@ class LoggingCog(commands.Cog):
         guild = member.guild
         current_time = get_indian_time()
         user_avatar_url = member.avatar.url if member.avatar else (self.bot.user.avatar.url if self.bot.user.avatar else None)
-
+        try:
+            async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.kick):
+                if entry.target.id == member.id and (get_indian_time() - entry.created_at).total_seconds() < 5:
+                    moderator = entry.user
+                    reason = entry.reason if entry.reason else "No reason specified"
+                    embed = discord.Embed(
+                        title="Member Kicked",
+                        description=f"> **Member :** {member.name}({member.mention})\n> **Reason :** {reason}",
+                        color=13516350,
+                        timestamp=current_time
+                    )
+                    embed.set_footer(text=moderator.name, icon_url=moderator.avatar.url if moderator.avatar else None)
+                    embed.set_thumbnail(url=user_avatar_url)
+                    await self.send_embed(guild, "moderation", embed)
+                    return 
+        except discord.Forbidden:
+            print(f"Missing 'View Audit Log' permission in guild {guild.id} to check for kicks.")
+        except Exception as e:
+            print(f"Error checking for kick audit log in {guild.id}: {e}")
         if member.bot:
             title = "Bot left"
             description_lines = [
@@ -677,9 +839,13 @@ class LoggingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
-        if message.guild is None or message.author.bot:
+        if message.guild is None:
+            return
+        config = await self.get_guild_config_async(message.guild.id)
+        if not config.get("logging_enabled"):
             return
         if message.author.bot:
+            ignore_embeds = config.get("ignore_embeds", False)
             files_to_send = []
             attachment_details_for_embed = []
             if message.attachments:
@@ -694,6 +860,8 @@ class LoggingCog(commands.Cog):
                         
             embed_details_for_embed = []
             if message.embeds:
+                if ignore_embeds:
+                    return
                 for embed_obj in message.embeds:
                     embed_details_for_embed.append(f"{embed_obj.title if embed_obj.title else ''}")
                     embed_details_for_embed.append(f"{embed_obj.description if embed_obj.description else ''}")
@@ -717,7 +885,7 @@ class LoggingCog(commands.Cog):
             if message.content:
                 fields.append({
                     "name": "Message",
-                    "value": message.content,
+                    "value": message.content[:1024],
                     "inline": False
                 })
             if embed_details_for_embed:
@@ -725,20 +893,20 @@ class LoggingCog(commands.Cog):
                 if message.content:
                     fields.append({
                         "name": f"Embed Content",
-                        "value": embeds_value,
+                        "value": embeds_value[:1024],
                         "inline": False
                     })
                 else:
                     fields.append({
                         "name": f"Message",
-                        "value": embeds_value,
+                        "value": embeds_value[:1024],
                         "inline": False
                     })
             if attachment_details_for_embed:
                 attachments_value = ",\n".join(attachment_details_for_embed)
                 fields.append({
                     "name": f"{len(attachment_details_for_embed)} Attachment(s)",
-                    "value": attachments_value,
+                    "value": attachments_value[:1024],
                     "inline": False 
                 })
             embed = discord.Embed(
@@ -772,14 +940,14 @@ class LoggingCog(commands.Cog):
         if message.content:
             fields.append({
                 "name": "Message",
-                "value": message.content,
+                "value": message.content[:1024],
                 "inline": False
             })
         if attachment_details_for_embed:
             attachments_value = ",\n".join(attachment_details_for_embed)
             fields.append({
                 "name": f"{len(attachment_details_for_embed)} Attachment(s)",
-                "value": attachments_value,
+                "value": attachments_value[:1024],
                 "inline": False 
             })
         embed = discord.Embed(
@@ -844,7 +1012,11 @@ class LoggingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
-        if before.guild is None or before.author.bot or(before.content == after.content and before.embeds == after.embeds):
+        config = await self.get_guild_config_async(before.guild.id)
+        if not config.get("logging_enabled"):
+            return
+        ignore_embeds = config.get("ignore_embeds", False)
+        if before.guild is None or(before.content == after.content and before.embeds == after.embeds):
             return
         def extract_embed_details(embed: discord.Embed):
             details = []
@@ -865,6 +1037,8 @@ class LoggingCog(commands.Cog):
         if before.content:
             before_content_value += f"{before.content}"
         if before.embeds:
+            if ignore_embeds:
+                return
             for i, embed in enumerate(before.embeds):
                 before_content_value += f"\n{extract_embed_details(embed)}"
         if not before.content and not before.embeds:
@@ -873,6 +1047,8 @@ class LoggingCog(commands.Cog):
         if after.content:
             after_content_value += f"{after.content}"
         if after.embeds:
+            if ignore_embeds:
+                return
             for i, embed in enumerate(after.embeds):
                 after_content_value += f"\n{extract_embed_details(embed)}"
         if not after.content and not after.embeds:
@@ -890,9 +1066,9 @@ class LoggingCog(commands.Cog):
             timestamp=get_indian_time()
         )
         if not before_content_value == None :
-            embed.add_field(name="Before", value=before_content_value, inline=True)
+            embed.add_field(name="Before", value=before_content_value[:1024], inline=True)
         if not after_content_value == None :
-            embed.add_field(name="After", value=after_content_value, inline=True)
+            embed.add_field(name="After", value=after_content_value[:1024], inline=True)
         await self.send_embed(before.guild, "message", embed)
 
     @commands.Cog.listener()
@@ -904,6 +1080,8 @@ class LoggingCog(commands.Cog):
             return
         channel = guild.get_channel(payload.channel_id)
         if not channel or not isinstance(channel, TextChannel):
+            return
+        if await self._is_ignored(guild.id, user=payload.member, channel=channel):
             return
         try:
             message = await channel.fetch_message(payload.message_id)
@@ -935,11 +1113,13 @@ class LoggingCog(commands.Cog):
         channel = guild.get_channel(payload.channel_id)
         if not channel or not isinstance(channel, TextChannel):
             return
+        member = guild.get_member(payload.user_id)
+        if await self._is_ignored(guild.id, user=member, channel=channel):
+            return
         try:
             message = await channel.fetch_message(payload.message_id)
         except discord.NotFound:
             message = None
-        member = guild.get_member(payload.user_id)
         if member and member.bot:
             return
         description = (
@@ -993,6 +1173,8 @@ class LoggingCog(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         if not channel.guild:
+            return
+        if await self._is_ignored(channel.guild.id, channel=channel):
             return
         deleter = None
         try:
@@ -1048,6 +1230,8 @@ class LoggingCog(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
         if not before.guild:
+            return
+        if await self._is_ignored(before.guild.id, channel=after):
             return
         action_user = None
         audit_log_reason = None 
@@ -1201,6 +1385,8 @@ class LoggingCog(commands.Cog):
     async def on_member_update(self, before: Member, after: Member):
         if before.guild is None:
             return
+        if await self._is_ignored(before.guild.id, user=after):
+            return
         def get_reason_line_for_member(reason):
             if reason and reason not in ["Missing Audit Log permissions", "Error fetching reason", "No reason specified"]:
                 return f"> **Reason :** {reason}"
@@ -1251,6 +1437,35 @@ class LoggingCog(commands.Cog):
         if before.roles != after.roles:
             added_roles = set(after.roles) - set(before.roles)
             removed_roles = set(before.roles) - set(after.roles)
+            if added_roles:
+                dangerous_perms_flags = {'administrator', 'manage_guild', 'manage_roles', 'manage_channels', 'ban_members', 'kick_members', 'mention_everyone'}
+                assigned_dangerous_roles = {}
+                for role in added_roles:
+                    role_perms = {perm for perm, value in role.permissions if value}
+                    dangerous_perms_in_role = role_perms.intersection(dangerous_perms_flags)
+                    if dangerous_perms_in_role:
+                        assigned_dangerous_roles[role] = list(dangerous_perms_in_role)
+                if assigned_dangerous_roles:
+                    assigner = None
+                    for entry in audit_logs_role_update:
+                        assigner = entry.user
+                        break
+                    description_lines = [
+                        f"> **Member:** {after.mention} (`{after.id}`)",
+                        f"> **Assigned By:** {assigner.mention if assigner else 'Unknown'}"
+                    ]
+                    for role, perms in assigned_dangerous_roles.items():
+                        perm_str = '`, `'.join(p.replace('_', ' ').title() for p in perms)
+                        description_lines.append(f"\n> **Role Assigned:** {role.mention}\n> **Grants Permissions:** `{perm_str}`")
+                    alert_embed = discord.Embed(
+                        title="High-risk role granted",
+                        description="\n".join(description_lines),
+                        color=0xFF0000,
+                        timestamp=get_indian_time()
+                    )
+                    if assigner:
+                        alert_embed.set_footer(text=f"{assigner.name}", icon_url=assigner.display_avatar.url)
+                    await self.send_embed(after.guild, "alert", alert_embed)
             if added_roles or removed_roles:
                 action_user = None
                 action_reason = audit_log_reason_global
@@ -1321,55 +1536,57 @@ class LoggingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: Guild, user: discord.User):
+        if await self._is_ignored(guild.id, user=user):
+            return
         if user.id == self.bot.user.id:
             return
-        moderator = "Unknown"
+        moderator_user = None
         ban_reason = "No reason specified"
         try:
             async for entry in guild.audit_logs(limit=1, action=AuditLogAction.ban):
                 if entry.target.id == user.id and (get_indian_time() - entry.created_at).total_seconds() < 5:
-                    moderator = entry.user.mention
+                    moderator_user = entry.user
                     if entry.reason:
                         ban_reason = entry.reason
                     break
         except discord.Forbidden:
-            moderator = "Unknown (Missing Audit Log permissions)"
-            ban_reason = "No reason specified (Missing Audit Log permissions)"
+            ban_reason = "Could not fetch reason (Missing Audit Log permissions)"
         embed = discord.Embed(
             title="Member Banned",
-            description=(
-                f"> **User :** {user.mention}\n"
-                f"> **User ID :** {user.id}\n"
-                f"> **Moderator :** {moderator}\n"
-                f"> **Reason :** {ban_reason}"
-            ),
-            color=self.logging_color
+            description=f"> **Member :** {user.name}({user.mention})\n> **Reason :** {ban_reason}",
+            color=13516350,
+            timestamp=get_indian_time()
         )
-        embed.set_author(name=f"{self.bot.user.name} Logging system", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-        embed.set_thumbnail(url=user.avatar.url if user.avatar else (self.bot.user.avatar.url if self.bot.user.avatar else None))
+        if moderator_user:
+            embed.set_footer(text=moderator_user.name, icon_url=moderator_user.avatar.url if moderator_user.avatar else None)
+        else:
+            embed.set_footer(text="Unknown Moderator") 
+        embed.set_thumbnail(url=user.avatar.url if user.avatar else None)
         await self.send_embed(guild, "moderation", embed)
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild: Guild, user: discord.User):
-        moderator = "Unknown"
+        if await self._is_ignored(guild.id, user=user):
+            return
+        moderator_user = None
         try:
             async for entry in guild.audit_logs(limit=1, action=AuditLogAction.unban):
                 if entry.target.id == user.id and (get_indian_time() - entry.created_at).total_seconds() < 5:
-                    moderator = entry.user.mention
+                    moderator_user = entry.user
                     break
         except discord.Forbidden:
-            moderator = "Unknown (Missing Audit Log permissions)"
+            pass
         embed = discord.Embed(
             title="Member Unbanned",
-            description=(
-                f"> **User :** {user.mention}\n"
-                f"> **User ID :** {user.id}\n"
-                f"> **Moderator :** {moderator}"
-            ),
-            color=self.logging_color
+            description=f"> **Member :** {user.name}({user.mention})\n> **Reason :** Not Applicable",
+            color=4606610,
+            timestamp=get_indian_time()
         )
-        embed.set_author(name=f"{self.bot.user.name} Logging system", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-        embed.set_thumbnail(url=user.avatar.url if user.avatar else (self.bot.user.avatar.url if self.bot.user.avatar else None))
+        if moderator_user:
+            embed.set_footer(text=moderator_user.name, icon_url=moderator_user.avatar.url if moderator_user.avatar else None)
+        else:
+            embed.set_footer(text="Unknown Moderator")  
+        embed.set_thumbnail(url=user.avatar.url if user.avatar else None)
         await self.send_embed(guild, "moderation", embed)
 
     async def get_audit_log_entry_for_role(self, guild: Guild, action_type: AuditLogAction, target_id: int, time_window: int = 60):
@@ -1479,6 +1696,7 @@ class LoggingCog(commands.Cog):
                 after.guild, AuditLogAction.role_update, after.id
             )
             embed = create_role_update_embed("Role permission update", after, action_user, audit_log_reason)
+            dangerous_perms = ["administrator", "kick_members", "ban_members","manage_guild", "manage_channels", "manage_roles"]
             old_perms = set(p for p, v in before.permissions if v)
             new_perms = set(p for p, v in after.permissions if v)
             added_perms = new_perms - old_perms
@@ -1503,6 +1721,16 @@ class LoggingCog(commands.Cog):
                     embed.description += (
                         f"> **Permission(s) removed :** ```{value}```"
                     )
+            added_dangerous_perms = [p.replace('_', ' ').title() for p in added_perms if p in dangerous_perms]
+            if added_dangerous_perms:
+                alert_embed = discord.Embed(
+                    title="Critical Perms Granted ⚠️",
+                    description=f"> **Role:** @{after.name}({after.mention})\n"
+                                f"> **Action By:** @{action_user.name}({action_user.mention})\n"
+                                f"> **Granted Permissions:** `{'`, `'.join(added_dangerous_perms)}`",
+                    color=0xce3636
+                )
+                await self.send_embed(after.guild, "alert", alert_embed)
             await self.send_embed(after.guild, "role", embed)
         if before.hoist != after.hoist:
             action_user, audit_log_reason = await self.get_audit_log_entry_for_role(
@@ -1540,6 +1768,9 @@ class LoggingCog(commands.Cog):
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: Member, before: discord.VoiceState, after: discord.VoiceState):
         guild = member.guild
+        config = await self.get_guild_config_async(guild.id)
+        if config.get("voice_log_ignore", False) and await self._is_ignored(guild.id, user=member):
+            return
         current_time = get_indian_time()
         user_avatar_url = member.avatar.url if member.avatar else (self.bot.user.avatar.url if self.bot.user.avatar else None)
         if before.channel is None and after.channel is not None:
@@ -1755,6 +1986,8 @@ class LoggingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_invite_create(self, invite: discord.Invite):
+        if await self._is_ignored(invite.guild.id, channel=invite.channel):
+            return
         creator = None
         current_time = get_indian_time()
         try:
@@ -1783,6 +2016,8 @@ class LoggingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_invite_delete(self, invite: discord.Invite):
+        if await self._is_ignored(invite.guild.id, channel=invite.channel):
+            return
         deleter = None
         current_time = get_indian_time()
         try:
@@ -1807,6 +2042,8 @@ class LoggingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_webhooks_update(self, channel: Union[TextChannel, VoiceChannel]):
+        if await self._is_ignored(channel.guild.id, channel=channel):
+            return
         guild = channel.guild
         action_user = None
         audit_log_reason = None
@@ -1936,6 +2173,8 @@ class LoggingCog(commands.Cog):
     async def on_audit_log_entry_create(self, entry: discord.AuditLogEntry):
         guild = entry.guild
         if not guild:
+            return
+        if await self._is_ignored(guild.id, user=entry.user):
             return
         relevant_actions = [
             AuditLogAction.integration_create,
