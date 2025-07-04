@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from discord import app_commands, Interaction, Member, Guild, Webhook, TextChannel, AuditLogAction, VoiceChannel, StageChannel ,Role
+from discord import app_commands, Interaction, Member, Guild, Webhook, TextChannel, AuditLogAction, VoiceChannel, StageChannel ,Role , Thread ,StageInstance , User , ScheduledEvent
 import aiohttp
 from zoneinfo import ZoneInfo
 import datetime
@@ -22,10 +22,13 @@ class LoggingCog(commands.Cog):
             "system": {"name": "system logs", "emoji": "💻"},
             "member": {"name": "member logs", "emoji": "👤"},
             "message": {"name": "message logs", "emoji": "💬"},
+            "thread": {"name": "thread logs", "emoji": "🧵"},
             "voice": {"name": "voice logs", "emoji": "🔊"},
+            "stage": {"name": "stage logs", "emoji": "🎤"},
             "moderation": {"name": "moderation logs", "emoji": "🔨"},
             "channel": {"name": "channel logs", "emoji": "📩"},
             "server": {"name": "server logs", "emoji": "🌐"},
+            "schedule": {"name": "event logs", "emoji": "📅"},
             "webhook": {"name": "webhook logs","emoji": "🔗"},
             "role": {"name": "role logs","emoji": "⚙️"},
             "application": {"name": "application logs","emoji": "🤖"},
@@ -339,7 +342,11 @@ class LoggingCog(commands.Cog):
         app_commands.Choice(name="Server Logs", value="server"),
         app_commands.Choice(name="Webhook Logs", value="webhook"),
         app_commands.Choice(name="Role Logs", value="role"),
-        app_commands.Choice(name="Application Logs", value="application") 
+        app_commands.Choice(name="Application Logs", value="application"),
+        app_commands.Choice(name="Thread Logs", value="thread"),
+        app_commands.Choice(name="Event Logs", value="schedule"),
+        app_commands.Choice(name="Stage Logs", value="stage"),
+        app_commands.Choice(name="Alert Logs", value="alert")
     ])
     async def logging_setup_channel(self, interaction: Interaction, log_type: app_commands.Choice[str], channel: TextChannel):
         guild = interaction.guild
@@ -428,6 +435,18 @@ class LoggingCog(commands.Cog):
     async def alert_logs(self, interaction: Interaction, channel: TextChannel):
         await self._setup_log_channel(interaction, "alert", channel)
 
+    @logging_group.command(name="thread_logs", description="Sets the channel for thread & forum logs.")
+    async def thread_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "thread", channel)
+
+    @logging_group.command(name="event_logs", description="Sets the channel for scheduled event logs.")
+    async def scheduled_event_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "schedule", channel)
+        
+    @logging_group.command(name="stage_logs", description="Sets the channel for stage event logs.")
+    async def stage_logs(self, interaction: Interaction, channel: TextChannel):
+        await self._setup_log_channel(interaction, "stage", channel)
+        
     @logging_group.command(name="disable", description="Disables logging for a specific log type.")
     @app_commands.choices(log_type=[
         app_commands.Choice(name="System Logs", value="system"),
@@ -439,7 +458,11 @@ class LoggingCog(commands.Cog):
         app_commands.Choice(name="Server Logs", value="server"),
         app_commands.Choice(name="Webhook Logs", value="webhook"),
         app_commands.Choice(name="Role Logs", value="role"),
-        app_commands.Choice(name="Application Logs", value="application")
+        app_commands.Choice(name="Application Logs", value="application"),
+        app_commands.Choice(name="Thread Logs", value="thread"),
+        app_commands.Choice(name="Event Logs", value="schedule"),
+        app_commands.Choice(name="Stage Logs", value="stage"),
+        app_commands.Choice(name="Alert Logs", value="alert")
     ])
     async def logging_disable(self, interaction: Interaction, log_type: app_commands.Choice[str]):
         guild = interaction.guild
@@ -481,37 +504,70 @@ class LoggingCog(commands.Cog):
 
     @logging_group.command(name="status", description="Show the current logging configuration for this server.")
     async def logging_status(self, interaction: Interaction):
-        guild_id = interaction.guild.id
-        config = await self.get_guild_config_async(guild_id)
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        config = await self.get_guild_config_async(guild.id)
+        logging_enabled = config.get("logging_enabled", False)
         category_id = config.get("log_category_id")
-        category = interaction.guild.get_channel(category_id) if category_id else None
+        category = guild.get_channel(category_id) if category_id else None
         category_mention = category.mention if category else "`Not Set`"
-        channel_status_lines = []
-        log_channel_ids = config.get("log_channel_ids", {})
-        guide_arrow_emoji = "<:guidearrow:1378319093530366103>"
-        for log_type, details in self.log_channel_details.items():
-            channel_id = log_channel_ids.get(log_type)
-            channel_obj = interaction.guild.get_channel(channel_id) if channel_id else None
-            channel_mention = channel_obj.mention if channel_obj else "`Not configured`"
-            log_name = details["name"].title()
-            channel_status_lines.append(f"{guide_arrow_emoji} | **{log_name}** : {channel_mention}")
+        view_role = discord.utils.get(guild.roles, name=self.log_view_role_name)
+        view_role_mention = f"{view_role.mention}" if view_role else "`Not Set`"
         description = (
-            f"> **Category :** {category_mention}\n\n"
-            f"**__Logging Channels__**\n\n"
-            f"{'\n'.join(channel_status_lines)}"
+            f"> **Enabled :** `{logging_enabled}`\n"
+            f"> **Category :** {category_mention}\n"
+            f"> **View Role :** {view_role_mention}"
         )
         status_embed = discord.Embed(
-            title="Logging status",
+            title="Logging Status",
             description=description,
-            color=11579568,
+            color=self.logging_color,
             timestamp=get_indian_time()
+        )
+        log_channel_ids = config.get("log_channel_ids", {})
+        channel_status_lines = []
+        for log_type, details in self.log_channel_details.items():
+            channel_id = log_channel_ids.get(log_type)
+            channel_obj = guild.get_channel(channel_id) if channel_id else None
+            channel_mention = channel_obj.mention if channel_obj else "`Not configured`"
+            log_name = details["name"].title()
+            channel_status_lines.append(f"- **{log_name}** : {channel_mention}")
+        if channel_status_lines:
+            status_embed.add_field(
+                name="Logging Channels",
+                value="\n".join(channel_status_lines),
+                inline=False
+            )
+        ignored_channel_ids = config.get("ignored_channels", [])
+        ignored_channels_mentions = [f"<#{cid}>" for cid in ignored_channel_ids]
+        status_embed.add_field(
+            name="Ignored Channels",
+            value=", ".join(ignored_channels_mentions) or "None",
+            inline=True
+        )
+        ignored_user_ids = config.get("ignored_users", [])
+        ignored_users_mentions = [f"<@{uid}>" for uid in ignored_user_ids]
+        status_embed.add_field(
+            name="Ignored Users",
+            value=", ".join(ignored_users_mentions) or "None",
+            inline=True
+        )
+        ignored_role_ids = config.get("ignored_roles", [])
+        ignored_roles_mentions = [f"<@&{rid}>" for rid in ignored_role_ids]
+        status_embed.add_field(
+            name="Ignored Roles",
+            value=", ".join(ignored_roles_mentions) or "None",
+            inline=True
         )
         if self.bot.user.avatar:
             status_embed.set_thumbnail(url=self.bot.user.avatar.url)
             status_embed.set_footer(text=self.bot.user.name, icon_url=self.bot.user.avatar.url)
         else:
             status_embed.set_footer(text=self.bot.user.name)
-        await interaction.response.send_message(embed=status_embed, ephemeral=True)
+        await interaction.followup.send(embed=status_embed)
 
     @logging_group.command(name="help", description="Shows how to fully set up the logging system.")
     async def logging_help(self, interaction: Interaction):
@@ -1451,16 +1507,15 @@ class LoggingCog(commands.Cog):
                         assigner = entry.user
                         break
                     description_lines = [
-                        f"> **Member:** {after.mention} (`{after.id}`)",
-                        f"> **Assigned By:** {assigner.mention if assigner else 'Unknown'}"
+                        f"> **Member:** @{after.name}({after.mention})",
                     ]
                     for role, perms in assigned_dangerous_roles.items():
                         perm_str = '`, `'.join(p.replace('_', ' ').title() for p in perms)
-                        description_lines.append(f"\n> **Role Assigned:** {role.mention}\n> **Grants Permissions:** `{perm_str}`")
+                        description_lines.append(f"> **Role Assigned:** {role.mention}\n> **Grants Permissions:** `{perm_str}`")
                     alert_embed = discord.Embed(
                         title="High-risk role granted",
                         description="\n".join(description_lines),
-                        color=0xFF0000,
+                        color=0xce3636,
                         timestamp=get_indian_time()
                     )
                     if assigner:
@@ -2051,7 +2106,7 @@ class LoggingCog(commands.Cog):
             async for entry in guild.audit_logs(limit=5):
                 if entry.action not in [AuditLogAction.webhook_create, AuditLogAction.webhook_delete, AuditLogAction.webhook_update]:
                     continue
-                if (get_indian_time() - entry.created_at).total_seconds() > 10:
+                if (get_indian_time() - entry.created_at).total_seconds() > 20:
                     continue
                 action_user = entry.user
                 audit_log_reason = entry.reason
@@ -2196,7 +2251,7 @@ class LoggingCog(commands.Cog):
             if application_avatar_url:
                 application_avatar_url = application_avatar_url.url
             description = (
-                f"> ** Application :** {application_name} ({application_mention})\n"
+                f"> **Application :** {application_name} ({application_mention})\n"
                 f"> **Application ID :** {application_id}"
             )
             if audit_log_reason:
@@ -2215,7 +2270,7 @@ class LoggingCog(commands.Cog):
         elif entry.action == AuditLogAction.integration_delete:
             deleted_application_info = entry.changes.before
             description = (
-                f"> ** Application :** {getattr(deleted_application_info, 'name', 'Unknown Application')}\n"
+                f"> **Application :** {getattr(deleted_application_info, 'name', 'Unknown Application')}\n"
                 f"> **Application ID :** {entry.target.id}"
             )
             if audit_log_reason:
@@ -2460,6 +2515,318 @@ class LoggingCog(commands.Cog):
             print(f"Missing 'View Audit Log' permission in guild {guild.id} for sticker logging.")
         except Exception as e:
             print(f"Error in on_guild_stickers_update for guild {guild.id}: {e}")
+
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread: Thread):
+        if await self._is_ignored(thread.guild.id, channel=thread.parent):
+            return
+        action_user = None
+        try:
+            async for entry in thread.guild.audit_logs(limit=1, action=discord.AuditLogAction.thread_create):
+                if entry.target.id == thread.id and (get_indian_time() - entry.created_at).total_seconds() < 10:
+                    action_user = entry.user
+                    break
+        except discord.Forbidden:
+            pass
+        if not action_user:
+            try:
+                action_user = await thread.fetch_owner()
+            except (discord.HTTPException, AttributeError):
+                 action_user = thread.owner
+        archive_timestamp = thread.archive_timestamp
+        archive_in_str = f"{discord.utils.format_dt(archive_timestamp, 'R')}" if archive_timestamp else "Manually"
+        description = (
+            f"> **Thread :** {thread.name}({thread.mention})\n"
+            f"> **Thread ID :** `{thread.id}`\n"
+            f"> **Channel :** {thread.parent.name}({thread.parent.mention})\n"
+            f"> **Archiving in :** {archive_in_str}"
+        )
+        embed = discord.Embed(
+            title="Thread created",
+            description=description, 
+            color=0xFF5858,
+            timestamp=get_indian_time()
+        )
+        if action_user:
+            embed.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+        await self.send_embed(thread.guild, "thread", embed)
+
+    @commands.Cog.listener()
+    async def on_thread_delete(self, thread: Thread):
+        if await self._is_ignored(thread.guild.id, channel=thread.parent):
+            return
+        action_user = None
+        try:
+            async for entry in thread.guild.audit_logs(limit=1, action=discord.AuditLogAction.thread_delete):
+                if entry.target.id == thread.id and (get_indian_time() - entry.created_at).total_seconds() < 10:
+                    action_user = entry.user
+                    break
+        except discord.Forbidden:
+            pass
+
+        description = (
+            f"> **Thread :** {thread.name}\n"
+            f"> **Thread ID :** `{thread.id}`\n"
+            f"> **Channel :** {thread.parent.name}({thread.parent.mention})\n"
+            f"> **Created :** {discord.utils.format_dt(thread.created_at, 'R')}"
+        )
+        embed = discord.Embed(
+            title="Thread deleted",
+            description=description,
+            color=0xCE3636,
+            timestamp=get_indian_time()
+        ) 
+        if action_user:
+            embed.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+        await self.send_embed(thread.guild, "thread", embed)
+
+    @commands.Cog.listener()
+    async def on_thread_update(self, before: Thread, after: Thread):
+        if await self._is_ignored(after.guild.id, channel=after.parent):
+            return
+        action_user = None
+        try:
+            async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.thread_update):
+                if entry.target.id == after.id and (get_indian_time() - entry.created_at).total_seconds() < 10:
+                    action_user = entry.user
+                    break
+        except discord.Forbidden:
+            pass
+        def set_footer(embed_to_set):
+            if action_user:
+                embed_to_set.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+            return embed_to_set
+        if before.archived and not after.archived:
+            description = (
+                f"> **Thread :** {after.name}({after.mention})\n"
+                f"> **Thread ID :** `{after.id}`\n"
+                f"> **Channel :** {after.parent.name}({after.parent.mention})"
+            )
+            embed = discord.Embed(title="Thread unarchived", description=description, color=0xFF5858, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "thread", set_footer(embed))
+        if not before.archived and after.archived:
+            description = (
+                f"> **Thread :** {after.name}({after.mention})\n"
+                f"> **Thread ID :** `{after.id}`\n"
+                f"> **Channel :** {after.parent.name}({after.parent.mention})\n"
+                f"> **Created :** {discord.utils.format_dt(after.created_at, 'R')}"
+            )
+            embed = discord.Embed(title="Thread archived", description=description, color=0xCE3636, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "thread", set_footer(embed))
+        if before.locked != after.locked:
+            title = "Thread locked" if after.locked else "Thread unlocked"
+            color = 0xCE3636 if after.locked else 0xFF5858
+            description = (
+                f"> **Thread :** {after.name}({after.mention})\n"
+                f"> **Thread ID :** `{after.id}`\n"
+                f"> **Channel :** {after.parent.name}({after.parent.mention})\n"
+                f"> **Created :** {discord.utils.format_dt(after.created_at, 'R')}"
+            )
+            embed = discord.Embed(title=title, description=description, color=color, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "thread", set_footer(embed))
+        if before.name != after.name:
+            description = (
+                f"> **Thread :** {after.name}({after.mention})\n"
+                f"> **Thread ID :** `{after.id}`\n"
+                f"> **Channel :** {after.parent.name}({after.parent.mention})\n"
+                f"> **Previous name :** {before.name}"
+            )
+            embed = discord.Embed(title="Thread name updated", description=description, color=0xB0B0B0, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "thread", set_footer(embed))
+        if before.slowmode_delay != after.slowmode_delay:
+            description = (
+                f"> **Thread :** {after.name}({after.mention})\n"
+                f"> **Thread ID :** `{after.id}`\n"
+                f"> **Channel :** {after.parent.name}({after.parent.mention})\n"
+                f"> **Slowmode :** `{before.slowmode_delay}s` > `{after.slowmode_delay}s`"
+            )
+            embed = discord.Embed(title="Thread slowmode updated", description=description, color=0xB0B0B0, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "thread", set_footer(embed))
+        if before.auto_archive_duration != after.auto_archive_duration:
+            description = (
+                f"> **Thread :** {after.name}({after.mention})\n"
+                f"> **Thread ID :** `{after.id}`\n"
+                f"> **Channel :** {after.parent.name}({after.parent.mention})\n"
+                f"> **Duration :** `{before.auto_archive_duration} mins` > `{after.auto_archive_duration} mins`"
+            )
+            embed = discord.Embed(title="Thread archive duration", description=description, color=0xB0B0B0, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "thread", set_footer(embed))
+
+    @commands.Cog.listener()
+    async def on_stage_instance_create(self, stage_instance: StageInstance):
+        if await self._is_ignored(stage_instance.guild.id, channel=stage_instance.channel):
+            return
+        action_user = None
+        try:
+            async for entry in stage_instance.guild.audit_logs(limit=1, action=discord.AuditLogAction.stage_instance_create):
+                if entry.target.id == stage_instance.id and (get_indian_time() - entry.created_at).total_seconds() < 10:
+                    action_user = entry.user
+                    break
+        except discord.Forbidden:
+            pass
+        except Exception as e:
+            print(f"Error fetching audit log for stage_instance_create in {stage_instance.guild.id}: {e}")
+        description = (
+            f"> **Channel :** {stage_instance.channel.name}({stage_instance.channel.mention})\n"
+            f"> **Topic :** `{stage_instance.topic}`"
+        )
+        embed = discord.Embed(title="Stage created",description=description,color=0xFF5858, timestamp=get_indian_time())
+        if action_user:
+            embed.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+        await self.send_embed(stage_instance.guild, "stage", embed)
+
+    @commands.Cog.listener()
+    async def on_stage_instance_delete(self, stage_instance: StageInstance):
+        if await self._is_ignored(stage_instance.guild.id, channel=stage_instance.channel):
+            return
+        action_user = None
+        try:
+            async for entry in stage_instance.guild.audit_logs(limit=1, action=discord.AuditLogAction.stage_instance_delete):
+                if entry.target.id == stage_instance.id and (get_indian_time() - entry.created_at).total_seconds() < 10:
+                    action_user = entry.user
+                    break
+        except discord.Forbidden:
+            pass        
+        except Exception as e:
+            print(f"Error fetching audit log for stage_instance_delete in {stage_instance.guild.id}: {e}")
+        description = (
+            f"> **Channel :** {stage_instance.channel.name}({stage_instance.channel.mention})\n"
+            f"> **Topic :** `{stage_instance.topic}`"
+        )
+        embed = discord.Embed(title="Stage ended",description=description,color=0xCE3636, timestamp=get_indian_time())
+        if action_user:
+            embed.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+        await self.send_embed(stage_instance.guild, "stage", embed)
+
+    @commands.Cog.listener()
+    async def on_stage_instance_update(self, before: StageInstance, after: StageInstance):
+        if await self._is_ignored(after.guild.id, channel=after.channel):
+            return
+        if before.topic == after.topic:
+            return
+        action_user = None
+        try:
+            async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.stage_instance_update):
+                if entry.target.id == after.id and (get_indian_time() - entry.created_at).total_seconds() < 10:
+                    action_user = entry.user
+                    break
+        except discord.Forbidden:
+            pass
+        except Exception as e:
+            print(f"Error fetching audit log for stage_instance_update in {after.guild.id}: {e}")
+        description = (
+            f"> **Channel :** {after.channel.name}({after.channel.mention})\n"
+            f"> **Topic :** `{after.topic}`\n"
+            f"> **Previous :** `{before.topic}`"
+        )
+        embed = discord.Embed(title="Stage topic updated", description=description , color=0xB0B0B0 , timestamp=get_indian_time())
+        if action_user:
+            embed.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+        await self.send_embed(after.guild, "stage", embed)
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_create(self, event: ScheduledEvent):
+        action_user = event.creator
+        description = (
+            f"> **Event :** {event.name}\n"
+            f"> **Start :** {discord.utils.format_dt(event.start_time, 'F')}"
+        )
+        embed = discord.Embed(title="Event created", description=description, color=0xFF5858, timestamp=get_indian_time())
+        if action_user:
+            embed.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+        await self.send_embed(event.guild, "schedule", embed)
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_delete(self, event: ScheduledEvent):
+        action_user = None
+        try:
+            async for entry in event.guild.audit_logs(limit=1, action=discord.AuditLogAction.scheduled_event_delete):
+                if entry.target.id == event.id and (get_indian_time() - entry.created_at).total_seconds() < 10:
+                    action_user = entry.user
+                    break
+        except discord.Forbidden:
+            pass
+        end_time_str = f"\n> **End :** {discord.utils.format_dt(event.end_time, 'F')}" if event.end_time else ""
+        description = (
+            f"> **Event :** {event.name}\n"
+            f"> **Start :** {discord.utils.format_dt(event.start_time, 'F')}"
+            f"{end_time_str}"
+        )
+        embed = discord.Embed(title="Event canceled", description=description, color=0xCE3636, timestamp=get_indian_time())
+        if action_user:
+            embed.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+        await self.send_embed(event.guild, "schedule", embed)
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_update(self, before: ScheduledEvent, after: ScheduledEvent):
+        action_user = None
+        try:
+            async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.scheduled_event_update):
+                if entry.target.id == after.id and (get_indian_time() - entry.created_at).total_seconds() < 10:
+                    action_user = entry.user
+                    break
+        except discord.Forbidden:
+            pass
+
+        def set_footer(embed_to_set):
+            if action_user:
+                embed_to_set.set_footer(text=action_user.name, icon_url=action_user.display_avatar.url)
+            return embed_to_set
+
+        if before.name != after.name:
+            desc = f"> **Event :** {after.name}\n> **New Name :** `{after.name}`\n> **Previous :** `{before.name}`"
+            embed = discord.Embed(title="Event name updated", description=desc, color=0xB0B0B0, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "schedule", set_footer(embed))
+
+        if before.description != after.description:
+            desc = f"> **Event :** {after.name}\n> **Description :** `{after.description}`\n> **Previous :** `{before.description}`"
+            embed = discord.Embed(title="Event description updated", description=desc, color=0xB0B0B0, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "schedule", set_footer(embed))
+        
+        if before.status != after.status:
+            if after.status == discord.EventStatus.active:
+                desc = f"> **Event :** {after.name}\n> **Status :** {after.status.name.title()}"
+                embed = discord.Embed(title="Event started", description=desc, color=0x469292, timestamp=get_indian_time())
+                await self.send_embed(after.guild, "schedule", set_footer(embed))
+            elif after.status == discord.EventStatus.completed:
+                desc = f"> **Event :** {after.name}\n> **Status :** {after.status.name.title()}"
+                embed = discord.Embed(title="Event ended", description=desc, color=0xCE3E3E, timestamp=get_indian_time())
+                await self.send_embed(after.guild, "schedule", set_footer(embed))
+
+        if before.start_time != after.start_time:
+            desc = f"> **Event :** {after.name}\n> **Start time :** {discord.utils.format_dt(after.start_time, 'F')}\n> **Previous :** {discord.utils.format_dt(before.start_time, 'F')}"
+            embed = discord.Embed(title="Event start time updated", description=desc, color=0xB0B0B0, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "schedule", set_footer(embed))
+
+        if before.end_time != after.end_time:
+            desc = f"> **Event :** {after.name}\n> **End time :** {discord.utils.format_dt(after.end_time, 'F') if after.end_time else 'Not set'}\n> **Previous :** {discord.utils.format_dt(before.end_time, 'F') if before.end_time else 'Not set'}"
+            embed = discord.Embed(title="Event end time updated", description=desc, color=0xB0B0B0, timestamp=get_indian_time())
+            await self.send_embed(after.guild, "schedule", set_footer(embed))
+
+        if before.cover_image != after.cover_image:
+            desc = f"> **Event :** {after.name}\n> **Old Image :** [Old image link]({before.cover_image.url if before.cover_image else 'None'})"
+            embed = discord.Embed(title="Event image updated", description=desc, color=0xB0B0B0, timestamp=get_indian_time())
+            if after.cover_image:
+                embed.set_image(url=after.cover_image.url)
+            await self.send_embed(after.guild, "schedule", set_footer(embed))
+            
+    @commands.Cog.listener()
+    async def on_scheduled_event_user_add(self, event: ScheduledEvent, user: User):
+        if await self._is_ignored(event.guild.id, user=user):
+            return
+        description = f"> **Event :** {event.name}\n> **User :** @{user.name}({user.mention})"
+        embed = discord.Embed(title="Subscribed to event", description=description, color=0xFF5858, timestamp=get_indian_time())
+        embed.set_thumbnail(url=user.display_avatar.url)
+        await self.send_embed(event.guild, "schedule", embed)
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_user_remove(self, event: ScheduledEvent, user: User):
+        if await self._is_ignored(event.guild.id, user=user):
+            return
+        description = f"> **Event :** {event.name}\n> **User :** @{user.name}({user.mention})"
+        embed = discord.Embed(title="Unsubscribed from event", description=description, color=0xCE3636, timestamp=get_indian_time())
+        embed.set_thumbnail(url=user.display_avatar.url)
+        await self.send_embed(event.guild, "schedule", embed)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(LoggingCog(bot)) 
